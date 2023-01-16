@@ -1,99 +1,55 @@
+# Copyright (C) 2023 Björn A. Lindqvist <bjourne@gmail.com>
 from ast import *
+from jinja2 import Environment, FileSystemLoader, StrictUndefined, Template
+from pathlib import Path
+from sys import argv
 import operator
 
-PROG = '''
-__meta__ = {
-    'value_type' : 'real',
-    'neutral_value' : '0.0',
-    'array_types' : {
-        'real' : ['real_vector', 'real_array2d_t']
-    },
-    'inputs' : [
-        ('x', (8, 8))
-    ],
-    'outputs' : [
-        ('y', (8, 8))
-    ],
-    'libraries' : ['bjourne', 'ieee'],
-    'uses' : [
-        'bjourne.types.all',
-        'ieee.std_logic_1164.all',
-        'ieee.numeric_std.all'
-    ]
-}
+VHDL_TMPL = '''
+{% for key in meta['libraries'] -%}
+library {{ key }};
+{% endfor -%}
+{% for key in meta['uses'] -%}
+use {{ key }};
+{% endfor %}
+entity {{ entity }} is
+    port (
+        clk, rstn : in std_logic;
+        {% for dir, name, tp in iface -%}
+        {{ name }} : {{ dir }} {{ tp }}{% if not loop.last %};{% endif %}
+        {% endfor %}
+    );
+end {{ entity }};
 
-def loeffler(x):
-    C1_A = -0.78569495838
-    C1_B = -1.17587560241
-    C1_C =  0.98078528040
-    C3_A = -0.27589937928
-    C3_B = -1.38703984532
-    C3_C =  0.83146961230
+architecture rtl of {{ entity }} is
+    {% for sig_name, sig_vars in vars -%}
+    signal {{ sig_name }} : {{ array_types[0] }}(0 to {{ sig_vars|length - 1 }});
+    {% endfor %}
+begin
+    {% for l, r in targets -%}
+    {{ l }} <= {{ r }};
+    {% endfor %}
+    process (clk)
+    begin
+        if rising_edge(clk) then
+            if rstn = '0' then
+                {% for sig_name, _ in vars -%}
+                {{ sig_name }} <= (others => {{ meta['neutral'] }});
+                {% endfor %}
+            else
+                {% for _, stage_vars in vars -%}
+                {% for l, r in stage_vars -%}
+                {{ l }} <= {{ r }};
+                {% endfor -%}
+                {% endfor %}
+            end if;
+        end if;
+    end process;
+end architecture;
+'''.strip()
 
-    C6_A =  0.76536686473
-    C6_B = -1.84775906502
-    C6_C =  0.54119610014
-
-    NORM1 = 0.35355339059
-    NORM2 = 0.5
-
-    s10 = x[0] + x[7]
-    s11 = x[1] + x[6]
-    s12 = x[2] + x[5]
-    s13 = x[3] + x[4]
-
-    s14 = x[3] - x[4]
-    s15 = x[2] - x[5]
-    s16 = x[1] - x[6]
-    s17 = x[0] - x[7]
-
-    s20 = s10 + s13
-    s21 = s11 + s12
-    s22 = s11 - s12
-    s23 = s10 - s13
-
-    c3_rot_tmp = C3_C * (s14 + s17)
-    c1_rot_tmp = C1_C * (s15 + s16)
-
-    s24 = C3_A * s17 + c3_rot_tmp
-    s25 = C1_A * s16 + c1_rot_tmp
-    s26 = C1_B * s15 + c1_rot_tmp
-    s27 = C3_B * s14 + c3_rot_tmp
-
-    c6_rot_tmp = C6_C * (s22 + s23)
-
-    s30 = s20 + s21
-    s31 = s20 - s21
-    s34 = s24 + s26
-    s35 = s27 - s25
-    s36 = s24 - s26
-    s37 = s27 + s25
-
-    y = zeros(8)
-    y[0] = NORM1 * s30
-    y[1] = NORM1 * (s37 + s34)
-    y[2] = NORM1 * (C6_A * s23 + c6_rot_tmp)
-    y[3] = NORM2 * s35
-    y[4] = NORM1 * s31
-    y[5] = NORM2 * s36
-    y[6] = NORM1 * (C6_B * s22 + c6_rot_tmp)
-    y[7] = NORM1 * (s37 - s34)
-    return y
-
-def transp8x8(x):
-    y = zeros(8, 8)
-    for i in range(8):
-        for j in range(8):
-            y[i][j] = x[j][i]
-    return y
-y = zeros(8)
-for i in range(8):
-    y[i] = loeffler(x[i])
-y = transp8x8(y)
-for i in range(8):
-    y[i] = loeffler(y[i])
-y = transp8x8(y)
-'''
+ENV = Environment()
+TMPL = ENV.from_string(VHDL_TMPL)
 
 LEAF_NODES = {
     Add, Constant, FloorDiv, Sub,
@@ -275,6 +231,7 @@ OPS_STRINGS = {
     Lt : '<',
     LtE : '<='
 }
+IDENT_0 = {Add, Sub}
 
 def const_eval(node):
     tp = type(node)
@@ -286,9 +243,9 @@ def const_eval(node):
         right = node.right
         ltp = type(left)
         rtp = type(right)
-        if ltp == Constant and left.value == 0 and top in {Add, Sub}:
+        if ltp == Constant and left.value == 0 and top in IDENT_0:
             return right
-        if rtp == Constant and right.value == 0 and top in {Add, Sub}:
+        if rtp == Constant and right.value == 0 and top in IDENT_0:
             return left
         if ltp == rtp == Constant:
             return Constant(fun(left.value, right.value))
@@ -358,10 +315,13 @@ def subst_vars(tp, node, defs):
         return const_eval(node)
     return node
 
+def fmt_stage(stage):
+    return 's%d' % stage
+
 def ensure_name(node, stage, cnt, introduced):
     expr = unparse(node)
     if expr not in introduced:
-        stage = Name('s%d' % stage)
+        stage = Name(fmt_stage(stage))
         idx = Constant(cnt[0])
         v = Subscript(stage, idx, Load())
         introduced[expr] = v, node
@@ -421,32 +381,64 @@ def fully_pipelined(node):
         return type(node.value) == Name and type(node.slice) == Constant
     return False
 
-def to_vhdl(node):
+def node_to_vhdl(node):
     tp = type(node)
     if tp == Name:
         return node.id
     elif tp == Constant:
         return str(node.value)
     elif tp == Subscript:
-        return '%s(%s)' % (to_vhdl(node.value), to_vhdl(node.slice))
+        return '%s(%s)' % (node_to_vhdl(node.value), node_to_vhdl(node.slice))
     elif tp == BinOp:
-        left = to_vhdl(node.left)
-        right = to_vhdl(node.right)
-        op = to_vhdl(node.op)
+        left = node_to_vhdl(node.left)
+        right = node_to_vhdl(node.right)
+        op = node_to_vhdl(node.op)
         return '%s %s %s' % (left, op, right)
     elif tp == List:
-        return '(%s)' % ', '.join(to_vhdl(n) for n in node.elts)
+        return '\n(%s)' % ', '.join(node_to_vhdl(n) for n in node.elts)
     elif tp in OPS:
         return OPS_STRINGS[tp]
     else:
         print(tp)
         assert False
 
+def vars_to_vhdl(meta, vars, targets):
+
+    value_type = meta['value_type']
+    array_types = meta['array_types'][value_type]
+    def type_decl(shape):
+        tp = value_type
+        if shape != 0:
+            arr_tp = array_types[len(shape) - 1]
+            ranges = [f'(0 to {d - 1})' for d in shape]
+            tp = f'{arr_tp}{"".join(ranges)}'
+        return tp
+
+    vars = [(stage_name, [(node_to_vhdl(l), node_to_vhdl(r))
+                          for (l, r) in stage_vars])
+            for (stage_name, stage_vars) in vars]
+
+    targets = [(l, node_to_vhdl(r)) for (l, r) in targets.items()]
+    entity = meta['entity']
+    iface = [('in', n, sh) for (n, sh) in meta['inputs']]
+    iface += [('out', n, sh) for (n, sh) in  meta['outputs']]
+    iface = [(d, n, type_decl(sh)) for (d, n, sh) in iface]
+    return TMPL.render(
+        meta = meta,
+        entity = entity,
+        iface = iface,
+        array_types = array_types,
+        vars = vars,
+        targets = targets)
+
 def main():
-    mod = parse(PROG)
+    in_path = Path(argv[1])
+    with in_path.open() as f:
+        mod = parse(f.read())
     defstack = [{}]
     def pre_subst(tp, node):
         if tp == FunctionDef:
+            print('  Traversing %s...' % node.name)
             defstack.append({})
         elif tp == If:
             test = node.test
@@ -483,19 +475,22 @@ def main():
             return None
         return node
 
-    print('Desugaring...')
+    meta = {}
+    for node in mod.body:
+        tp = type(node)
+        if tp == Assign and node.targets[0].id == '__meta__':
+            meta = literal_eval(node.value)
+
     mod = post_rewrite(mod, desugar)
 
-    print('Substituting...')
+    print('* Symbolic evaluation')
     mod = rewrite(mod, pre_subst, post_subst)
 
-    targets = {'y'}
+    targets = {t[0] for t in meta['outputs']}
     defs = {}
     none = Constant(None)
     for t in sorted(targets):
         defs[t] = defstack[-1].get(t, none)
-
-    print('Collecting inputs...')
 
     # Inputs is a dict from expr to node
     inputs = {}
@@ -503,22 +498,22 @@ def main():
         return collect_inputs(tp, n, defs, inputs)
     mod = post_rewrite(mod, fun)
 
+    # Begin pipelining.
+    print('* Pipelining')
     stage = 1
     vars = []
     while not all(fully_pipelined(n) for n in defs.values()):
         inputs, defs = pipeline_exprs(defs, inputs, stage)
-        for lv, rv in inputs.values():
-            vars.append((lv, rv))
+        vars.append((fmt_stage(stage), list(inputs.values())))
         inputs = {unparse(lv) for (lv, _) in inputs.values()}
         stage += 1
 
-    # Add targets
-    for expr, n in defs.items():
-        vars.append((parse(expr).body[0].value, n))
+    vhdl = vars_to_vhdl(meta, vars, defs)
 
-    for lv, rv in vars:
-        lv = to_vhdl(lv)
-        rv = to_vhdl(rv)
-        print('%-6s <= %s;' % (lv, rv))
+    out_path = Path(in_path.stem + '.vhdl')
+    print('* Writing VHDL to "%s".' % out_path)
+    with out_path.open('w') as f:
+        f.write(vhdl)
+
 
 main()

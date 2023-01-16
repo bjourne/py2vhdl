@@ -1,15 +1,18 @@
 __meta__ = {
     'value_type' : 'real',
-    'neutral_value' : '0.0',
+    'neutral' : '0.0',
     'array_types' : {
         'real' : ['real_vector', 'real_array2d_t']
     },
+    'entity' : 'dct8x8',
     'inputs' : [
         ('x', (8, 8))
     ],
     'outputs' : [
         ('y', (8, 8))
     ],
+
+    # Declarations
     'libraries' : ['bjourne', 'ieee'],
     'uses' : [
         'bjourne.types.all',
