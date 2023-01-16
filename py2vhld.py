@@ -1,5 +1,6 @@
 # Copyright (C) 2023 Björn A. Lindqvist <bjourne@gmail.com>
 from ast import *
+from copy import deepcopy
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, Template
 from pathlib import Path
 from sys import argv
@@ -114,7 +115,9 @@ def rewrite(node, prefun, postfun):
         childs = rewrite_childs(node.elts, prefun, postfun)
         node = tp(childs, node.ctx)
     elif tp == Dict:
-        pass
+        keys = rewrite_childs(node.keys, prefun, postfun)
+        values = rewrite_childs(node.values, prefun, postfun)
+        node = tp(keys, values)
     elif tp == Module:
         childs = rewrite_childs(node.body, prefun, postfun)
         node = tp(childs, [])
@@ -185,31 +188,37 @@ def getdef(defs, key, default = None):
             return d[key]
     return default
 
-def make_assign(id, expr):
-    return Assign([Name(id, Store())], expr)
+def make_assign(node, expr):
+    node = deepcopy(node)
+    node.ctx = Store()
+    return Assign([node], expr)
 
-def make_aug_assign(id, op, value):
-    expr = BinOp(Name(id, Load()), op, value)
-    return make_assign(id, expr)
+def make_aug_assign(node, op, value):
+    node = deepcopy(node)
+    node.ctx = Load()
+    expr = BinOp(node, op, value)
+    return make_assign(node, expr)
 
-def make_compare(id, cmp, expr):
-    return Compare(Name(id, Load()), [cmp], [expr])
+def make_compare(node, cmp, expr):
+    node = deepcopy(node)
+    node.ctx = Load()
+    return Compare(node, [cmp], [expr])
 
 def desugar(tp, node):
     if tp == AugAssign:
-        return make_aug_assign(node.target.id, node.op, node.value)
+        return make_aug_assign(node.target, node.op, node.value)
     elif tp == For:
         target = node.target
-        id = target.id
+        # id = target.id
         iter = node.iter
 
         assert type(iter) == Call
         top = iter.args[0]
 
         body = node.body
-        init = make_assign(id, Constant(0))
-        test = make_compare(id, Lt(), top)
-        inc = make_aug_assign(id, Add(), Constant(1))
+        init = make_assign(target, Constant(0))
+        test = make_compare(target, Lt(), top)
+        inc = make_aug_assign(target, Add(), Constant(1))
         whl = While(test, node.body + [inc], [])
         nodes = [init, whl]
         return nodes
@@ -475,16 +484,18 @@ def main():
             return None
         return node
 
-    meta = {}
-    for node in mod.body:
-        tp = type(node)
-        if tp == Assign and node.targets[0].id == '__meta__':
-            meta = literal_eval(node.value)
 
     mod = post_rewrite(mod, desugar)
 
     print('* Symbolic evaluation')
     mod = rewrite(mod, pre_subst, post_subst)
+
+    print('* Get metadata')
+    meta = {}
+    for node in mod.body:
+        tp = type(node)
+        if tp == Assign and node.targets[0].id == '__meta__':
+            meta = literal_eval(node.value)
 
     targets = {t[0] for t in meta['outputs']}
     defs = {}
