@@ -1,16 +1,122 @@
 # Copyright (C) 2023 Björn A. Lindqvist <bjourne@gmail.com>
 from ast import *
+from collections import defaultdict
 from copy import deepcopy
 from itertools import product
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, Template
 from pathlib import Path
+from pygraphviz import AGraph
 from sys import argv
 import operator
 
-# Random utils
+# Utils
 def flatten(l):
     return [item for sublist in l for item in sublist]
 
+# Plotting
+def setup_graph():
+    G = AGraph(strict = False, directed = True)
+    graph_attrs = {
+        'dpi' : 300,
+        'ranksep' : 0.22,
+        'fontname' : 'Inconsolata',
+        'bgcolor' : 'transparent'
+    }
+    G.graph_attr.update(graph_attrs)
+    node_attrs = {
+        'shape' : 'box',
+        'width' : 0.55,
+        'style' : 'filled',
+        'fillcolor' : 'white'
+    }
+    G.node_attr.update(node_attrs)
+    edge_attrs = {
+        'fontsize' : '10pt'
+    }
+    G.edge_attr.update(edge_attrs)
+    return G
+
+NODE_FILLCOLORS = {
+    Subscript : '#ffddee',
+    BinOp : '#eeffdd',
+    Call : '#ddeeff',
+    List : '#eeddff',
+    Name : '#ffddee',
+    'input' : '#fff3cc'
+}
+
+def plot_defs(file_name, input_vars, defs):
+    G = setup_graph()
+
+    keyed_nodes = {}
+    adj_list = defaultdict(list)
+
+    def node_label(node):
+        tp = type(node)
+        if tp == Subscript:
+            return unparse(node)
+        elif tp == BinOp:
+            return OPS_STRINGS[type(node.op)]
+        elif tp == Call:
+            return node.func.id
+        elif tp == List:
+            return '[]'
+        elif tp == Name:
+            return node.id
+        assert False
+
+    def node_fillcolor(node):
+        tp = type(node)
+        if tp == Subscript and node.value.id in input_vars:
+            return NODE_FILLCOLORS['input']
+        return NODE_FILLCOLORS.get(tp, 'white')
+
+    def add_node(node):
+        key = unparse(node)
+        if key in keyed_nodes:
+            return key
+        tp = type(node)
+
+        childs = []
+        if tp == List:
+            childs = node.elts
+        elif tp == BinOp:
+            childs = [node.left, node.right]
+        elif tp == Call:
+            childs = node.args
+
+        keys = [add_node(n) for n in childs]
+        if tp == List:
+            return keys
+        else:
+            keyed_nodes[key] = node
+            adj_list[key] = keys
+            return key
+
+    # Fix this someday for multidimensional arrays.
+    for var, node in defs.items():
+        keys = add_node(node)
+        for i, key in enumerate(keys):
+            node = make_subscript(var, (Constant(i),))
+            key = unparse(node)
+            keyed_nodes[key] = node
+            adj_list[key] = [keys[i]]
+
+    indexes = {n : i for (i, n) in enumerate(adj_list)}
+    for k1, k2s in adj_list.items():
+        i1 = indexes[k1]
+        node = keyed_nodes[k1]
+        kw = {
+            'label' : node_label(node),
+            'fillcolor' : node_fillcolor(node)
+        }
+        G.add_node(i1, **kw)
+        for k2 in k2s:
+            i2 = indexes[k2]
+            G.add_edge(i2, i1)
+    G.draw(file_name, prog = 'dot')
+
+# Templating
 VHDL_TMPL = '''
 {% for key in meta['libraries'] -%}
 library {{ key }};
@@ -184,6 +290,9 @@ def setelem(node, path, src):
         node.elts[path[-1]] = src
     elif tp == Subscript:
         return setelem(node.value, [node.slice.value] + path, src)
+    else:
+        print(tp, unparse(node))
+        assert False
 
 def setdef2(defs, dst, src):
     tp = type(dst)
@@ -214,12 +323,15 @@ def make_compare(node, cmp, expr):
     node.ctx = Load()
     return Compare(node, [cmp], [expr])
 
-def make_load_subscript(var, indices):
+def make_subscript(var, indices):
     ctx = Load()
     if len(indices) == 1:
         return Subscript(Name(var, ctx), indices[0], ctx)
-    ss = make_load_subscript(var, indices[:-1])
+    ss = make_subscript(var, indices[:-1])
     return Subscript(ss, indices[-1], ctx)
+
+def make_call(fun, args):
+    return Call(Name(fun), args, [])
 
 def desugar(tp, node):
     if tp == AugAssign:
@@ -310,7 +422,7 @@ def bind_subst(defs):
 def subst_vars(tp, node, defs):
     if tp == Assign:
         tgt = node.targets[0]
-        setdef2(defs, node.targets[0], node.value)
+        setdef2(defs, tgt, node.value)
     elif tp == BinOp:
         return const_eval(node)
     elif tp == Call:
@@ -402,7 +514,7 @@ def pipeline_exprs(defs, inputs, gen):
 def input_nodes(var, shape):
     cells = product(*[range(n) for n in shape])
     cells = [[Constant(c) for c in cell] for cell in cells]
-    cells = [make_load_subscript(var, cell) for cell in cells]
+    cells = [make_subscript(var, cell) for cell in cells]
     return cells
 
 def node_to_vhdl(node):
@@ -457,10 +569,21 @@ def vars_to_vhdl(meta, vars, targets, entity):
         vars = vars,
         targets = targets)
 
+def find_metadata_node(nodes):
+    for i, node in enumerate(nodes):
+        if type(node) == Assign:
+            target = node.targets[0]
+            tpt = type(target)
+            if tpt == Name and target.id == '__meta__':
+                return i, node.value
+    assert False
+
 def main():
     in_path = Path(argv[1])
     with in_path.open() as f:
         mod = parse(f.read())
+    entity = in_path.stem
+
     defstack = [{}]
     def pre_subst(tp, node):
         if tp == FunctionDef:
@@ -497,24 +620,29 @@ def main():
             setdef(defstack, node.name, (params, ret.value))
             return None
         elif tp == If:
-            defstack.pop()
+            #defstack.pop()
             return None
         return node
 
     mod = post_rewrite(mod, desugar)
 
+    # Add initialization based on the metadata:
+    print('* Adding initialization')
+    inits = []
+    i, meta = find_metadata_node(mod.body)
+    for k, v in zip(meta.keys, meta.values):
+        if k.value == 'outputs':
+            for el in v.elts:
+                var, args = el.elts
+                call = make_call('zeros', args.elts)
+                inits.append(make_assign(Name(var.value), call))
+    mod.body = mod.body[:i + 1] + inits + mod.body[i + 1:]
+
     print('* Symbolic evaluation')
     mod = rewrite(mod, pre_subst, post_subst)
 
     print('* Get metadata')
-    meta = {}
-    for node in mod.body:
-        tp = type(node)
-        if tp == Assign:
-            target = node.targets[0]
-            tpt = type(target)
-            if tpt == Name and target.id == '__meta__':
-                meta = literal_eval(node.value)
+    meta = literal_eval(find_metadata_node(mod.body)[1])
 
     targets = {t[0] for t in meta['outputs']}
     defs = {}
@@ -522,7 +650,10 @@ def main():
     for t in sorted(targets):
         defs[t] = defstack[-1].get(t, none)
 
-    # Produce inputs
+    input_vars = [i[0] for i in meta['inputs']]
+    plot_defs(entity + '.png', input_vars, defs)
+
+    # Collect inputs
     inputs = flatten(input_nodes(v, sh) for (v, sh) in meta['inputs'])
     inputs = {unparse(i) : (i, i) for i in inputs}
 
@@ -536,7 +667,7 @@ def main():
         inputs = {unparse(lv) for (lv, _) in inputs.values()}
         stage += 1
 
-    entity = in_path.stem
+
     vhdl = vars_to_vhdl(meta, vars, defs, entity)
 
     out_path = Path(entity + '.vhdl')
