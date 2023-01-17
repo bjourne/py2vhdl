@@ -1,10 +1,6 @@
 __meta__ = {
-    'value_type' : 'real',
     'neutral' : '0.0',
-    'array_types' : {
-        'real' : ['real_vector', 'real_array2d_t']
-    },
-    'entity' : 'dct8x8',
+    'types' : ['real', 'real_vector', 'real_array2d_t'],
     'inputs' : [
         ('x', (8, 8))
     ],
@@ -85,7 +81,6 @@ def transp8x8(x):
         for j in range(8):
             y[i][j] = x[j][i]
     return y
-y = zeros(8)
 for i in range(8):
     y[i] = loeffler(x[i])
 y = transp8x8(y)

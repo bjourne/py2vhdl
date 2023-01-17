@@ -67,8 +67,10 @@ def plot_defs(file_name, input_vars, defs):
 
     def node_fillcolor(node):
         tp = type(node)
-        if tp == Subscript and node.value.id in input_vars:
-            return NODE_FILLCOLORS['input']
+        if tp == Subscript:
+            val = node.value
+            if type(val) == Name and val.id in input_vars:
+                return NODE_FILLCOLORS['input']
         return NODE_FILLCOLORS.get(tp, 'white')
 
     def add_node(node):
@@ -112,6 +114,7 @@ def plot_defs(file_name, input_vars, defs):
         }
         G.add_node(i1, **kw)
         for k2 in k2s:
+            print(k2)
             i2 = indexes[k2]
             G.add_edge(i2, i1)
     G.draw(file_name, prog = 'dot')
@@ -667,9 +670,7 @@ def main():
         inputs = {unparse(lv) for (lv, _) in inputs.values()}
         stage += 1
 
-
     vhdl = vars_to_vhdl(meta, vars, defs, entity)
-
     out_path = Path(entity + '.vhdl')
     print('* Writing VHDL to "%s".' % out_path)
     with out_path.open('w') as f:
