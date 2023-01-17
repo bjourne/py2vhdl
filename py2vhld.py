@@ -1,10 +1,15 @@
 # Copyright (C) 2023 Björn A. Lindqvist <bjourne@gmail.com>
 from ast import *
 from copy import deepcopy
+from itertools import product
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, Template
 from pathlib import Path
 from sys import argv
 import operator
+
+# Random utils
+def flatten(l):
+    return [item for sublist in l for item in sublist]
 
 VHDL_TMPL = '''
 {% for key in meta['libraries'] -%}
@@ -24,7 +29,7 @@ end {{ entity }};
 
 architecture rtl of {{ entity }} is
     {% for sig_name, sig_vars in vars -%}
-    signal {{ sig_name }} : {{ array_types[0] }}(0 to {{ sig_vars|length - 1 }});
+    signal {{ sig_name }} : {{ types[1] }}(0 to {{ sig_vars|length - 1 }});
     {% endfor %}
 begin
     {% for l, r in targets -%}
@@ -53,22 +58,22 @@ ENV = Environment()
 TMPL = ENV.from_string(VHDL_TMPL)
 
 LEAF_NODES = {
-    Add, Constant, FloorDiv, Sub,
-    Eq, Lt, LtE,
-    Mod, Mult, Name, Pass,
-    USub
+    Add, Constant, Div, FloorDiv, Mod, Mult, Name, Pass, Sub,
+    Eq, Lt, LtE, USub
 }
+
+def container_childs(node):
+    tp = type(node)
+    if tp == Call:
+        return node.args
+    elif tp == List:
+        return node.elts
+    assert False
 
 def rewrite_childs(childs, prefun, postfun):
     childs = [rewrite(n, prefun, postfun) for n in childs]
-    childs = [c for c in childs if c]
-    childs2 = []
-    for c in childs:
-        if isinstance(c, list):
-            childs2.extend(c)
-        else:
-            childs2.append(c)
-    return childs2
+    childs = [c if isinstance(c, list) else [c] for c in childs if c]
+    return flatten(childs)
 
 def rewrite(node, prefun, postfun):
     node = prefun(type(node), node)
@@ -90,7 +95,8 @@ def rewrite(node, prefun, postfun):
         right = rewrite(node.right, prefun, postfun)
         node = tp(left, op, right)
     elif tp == Call:
-        pass
+        childs = rewrite_childs(node.args, prefun, postfun)
+        node = tp(node.func, childs, [])
     elif tp == Compare:
         left = rewrite(node.left, prefun, postfun)
         ops = [rewrite(n, prefun, postfun) for n in node.ops]
@@ -163,6 +169,10 @@ INTRINSICS = {
     'zeros' : intrinsic_zeros
 }
 
+# Functions that carry no logic cost and thus shouldn't have a cell in
+# the pipeline.
+NO_LOGICS = {'std_logic_vector', 'to_float'}
+
 def setdef(defs, key, value):
     defs[-1][key] = value
 
@@ -204,6 +214,13 @@ def make_compare(node, cmp, expr):
     node.ctx = Load()
     return Compare(node, [cmp], [expr])
 
+def make_load_subscript(var, indices):
+    ctx = Load()
+    if len(indices) == 1:
+        return Subscript(Name(var, ctx), indices[0], ctx)
+    ss = make_load_subscript(var, indices[:-1])
+    return Subscript(ss, indices[-1], ctx)
+
 def desugar(tp, node):
     if tp == AugAssign:
         return make_aug_assign(node.target, node.op, node.value)
@@ -226,6 +243,7 @@ def desugar(tp, node):
 
 OPS = {Add : operator.add,
        Sub : operator.sub,
+       Div : operator.truediv,
        Eq : operator.eq,
        Lt : operator.lt,
        LtE : operator.le,
@@ -234,6 +252,7 @@ OPS = {Add : operator.add,
 
 OPS_STRINGS = {
     Add : '+',
+    Div : '/',
     Sub : '-',
     Mult : '*',
     Eq : '==',
@@ -283,13 +302,6 @@ def const_eval(node):
         print(tp)
         assert False
 
-def collect_inputs(tp, node, defs, inputs):
-    if tp in {Subscript, Name}:
-        expr = unparse(node)
-        if expr not in defs:
-            inputs[expr] = node, node
-    return node
-
 def bind_subst(defs):
     def subst(tp, node):
         return subst_vars(tp, node, defs)
@@ -304,16 +316,19 @@ def subst_vars(tp, node, defs):
     elif tp == Call:
         # Evaluate args
         args = [post_rewrite(a, bind_subst(defs)) for a in node.args]
-        fname = node.func.id
+        func = node.func
+        name = func.id
 
-        f = INTRINSICS.get(fname)
+        f = INTRINSICS.get(name)
         if f:
             return f(args)
-        params, expr = getdef(defs, fname)
-
-        # Calling context
-        defs = [{p : a for (p, a) in zip(params, args)}]
-        return post_rewrite(expr, bind_subst(defs))
+        f  = getdef(defs, name)
+        if f:
+            params, expr = getdef(defs, name)
+            # Calling context
+            defs = [{p : a for (p, a) in zip(params, args)}]
+            return post_rewrite(expr, bind_subst(defs))
+        node = tp(func, args, [])
     elif tp == Compare:
         return const_eval(node)
     elif tp == UnaryOp:
@@ -338,62 +353,66 @@ def ensure_name(node, stage, cnt, introduced):
         return v
     return introduced[expr][0]
 
-def operand_ok(node, inputs):
-    tp = type(node)
-    if tp == Constant:
-        return True
-    expr = unparse(node)
-    return expr in inputs
-
-def elim_binop(node, inputs, stage, cnt, introduced):
-    l = node.left
-    r = node.right
-    ltp = type(l)
-    rtp = type(r)
-    lok = operand_ok(l, inputs)
-    rok = operand_ok(r, inputs)
-    if lok and rok:
-        return ensure_name(node, stage, cnt, introduced)
-    return node
-
-def elim_name(node, inputs, stage, cnt, introduced):
-    expr = unparse(node)
-    if not expr in inputs:
-        return node
-    return ensure_name(node, stage, cnt, introduced)
-
-def pipeline_exprs(defs, inputs, gen):
-    introduced = {}
-    cnt = [0]
-    def pipeline_binops(tp, node):
-        if tp == BinOp:
-            return elim_binop(node, inputs, gen, cnt, introduced)
-        return node
-    def pipeline_names(tp, node):
-        if tp in {Name, Subscript}:
-            return elim_name(node, inputs, gen, cnt, introduced)
-        return node
-
-    defs = {k : post_rewrite(v, pipeline_binops)
-            for (k, v) in defs.items()}
-    defs = {k : post_rewrite(v, pipeline_names)
-            for (k, v) in defs.items()}
-    return introduced, defs
-
+# Merge these?
 def fully_pipelined(node):
     tp = type(node)
     if tp in {Constant, Name}:
         return True
     elif tp == List:
         return all(fully_pipelined(n) for n in node.elts)
+    elif tp == Call:
+        return all(fully_pipelined(n) for n in node.args)
     elif tp == Subscript:
         return type(node.value) == Name and type(node.slice) == Constant
     return False
 
+def node_is_const(node, inputs):
+    tp = type(node)
+    if tp == Constant:
+        return True
+    elif tp in {Name, Subscript}:
+        return unparse(node) in inputs
+    elif tp == Call:
+        if node.func.id not in NO_LOGICS:
+            return all(node_is_const(n, inputs) for n in node.args)
+    elif tp == BinOp:
+        lok = node_is_const(node.left, inputs)
+        rok = node_is_const(node.right, inputs)
+        return lok and rok
+    return False
+
+def pipeline_exprs(defs, inputs, gen):
+    introduced = {}
+    cnt = [0]
+    def pipeline_exprs(tp, node):
+        if tp in {BinOp, Call} and node_is_const(node, inputs):
+            return ensure_name(node, gen, cnt, introduced)
+        return node
+    def pipeline_names(tp, node):
+        if tp in {Name, Subscript} and unparse(node) in inputs:
+            return ensure_name(node, gen, cnt, introduced)
+        return node
+
+    defs = {k : post_rewrite(v, pipeline_exprs)
+            for (k, v) in defs.items()}
+    defs = {k : post_rewrite(v, pipeline_names)
+            for (k, v) in defs.items()}
+    return introduced, defs
+
+def input_nodes(var, shape):
+    cells = product(*[range(n) for n in shape])
+    cells = [[Constant(c) for c in cell] for cell in cells]
+    cells = [make_load_subscript(var, cell) for cell in cells]
+    return cells
+
 def node_to_vhdl(node):
+    def comma_nodes(nodes):
+        return ', '.join(node_to_vhdl(n) for n in nodes)
     tp = type(node)
     if tp == Name:
         return node.id
+    elif tp == Call:
+        return '%s(%s)' % (node.func.id, comma_nodes(node.args))
     elif tp == Constant:
         return str(node.value)
     elif tp == Subscript:
@@ -404,31 +423,29 @@ def node_to_vhdl(node):
         op = node_to_vhdl(node.op)
         return '%s %s %s' % (left, op, right)
     elif tp == List:
-        return '\n(%s)' % ', '.join(node_to_vhdl(n) for n in node.elts)
+        return '\n(%s)' % comma_nodes(node.elts)
     elif tp in OPS:
         return OPS_STRINGS[tp]
     else:
         print(tp)
         assert False
 
-def vars_to_vhdl(meta, vars, targets):
+def vars_to_vhdl(meta, vars, targets, entity):
 
-    value_type = meta['value_type']
-    array_types = meta['array_types'][value_type]
+    types = meta['types']
     def type_decl(shape):
-        tp = value_type
-        if shape != 0:
-            arr_tp = array_types[len(shape) - 1]
-            ranges = [f'(0 to {d - 1})' for d in shape]
-            tp = f'{arr_tp}{"".join(ranges)}'
-        return tp
+        idx = len(shape)
+        tp  = types[idx]
+        if not idx:
+            return tp
+        ranges = [f'(0 to {d - 1})' for d in shape]
+        return f'{tp}{"".join(ranges)}'
 
     vars = [(stage_name, [(node_to_vhdl(l), node_to_vhdl(r))
                           for (l, r) in stage_vars])
             for (stage_name, stage_vars) in vars]
 
     targets = [(l, node_to_vhdl(r)) for (l, r) in targets.items()]
-    entity = meta['entity']
     iface = [('in', n, sh) for (n, sh) in meta['inputs']]
     iface += [('out', n, sh) for (n, sh) in  meta['outputs']]
     iface = [(d, n, type_decl(sh)) for (d, n, sh) in iface]
@@ -436,7 +453,7 @@ def vars_to_vhdl(meta, vars, targets):
         meta = meta,
         entity = entity,
         iface = iface,
-        array_types = array_types,
+        types = types,
         vars = vars,
         targets = targets)
 
@@ -484,7 +501,6 @@ def main():
             return None
         return node
 
-
     mod = post_rewrite(mod, desugar)
 
     print('* Symbolic evaluation')
@@ -494,8 +510,11 @@ def main():
     meta = {}
     for node in mod.body:
         tp = type(node)
-        if tp == Assign and node.targets[0].id == '__meta__':
-            meta = literal_eval(node.value)
+        if tp == Assign:
+            target = node.targets[0]
+            tpt = type(target)
+            if tpt == Name and target.id == '__meta__':
+                meta = literal_eval(node.value)
 
     targets = {t[0] for t in meta['outputs']}
     defs = {}
@@ -503,11 +522,9 @@ def main():
     for t in sorted(targets):
         defs[t] = defstack[-1].get(t, none)
 
-    # Inputs is a dict from expr to node
-    inputs = {}
-    def fun(tp, n):
-        return collect_inputs(tp, n, defs, inputs)
-    mod = post_rewrite(mod, fun)
+    # Produce inputs
+    inputs = flatten(input_nodes(v, sh) for (v, sh) in meta['inputs'])
+    inputs = {unparse(i) : (i, i) for i in inputs}
 
     # Begin pipelining.
     print('* Pipelining')
@@ -519,9 +536,10 @@ def main():
         inputs = {unparse(lv) for (lv, _) in inputs.values()}
         stage += 1
 
-    vhdl = vars_to_vhdl(meta, vars, defs)
+    entity = in_path.stem
+    vhdl = vars_to_vhdl(meta, vars, defs, entity)
 
-    out_path = Path(in_path.stem + '.vhdl')
+    out_path = Path(entity + '.vhdl')
     print('* Writing VHDL to "%s".' % out_path)
     with out_path.open('w') as f:
         f.write(vhdl)
