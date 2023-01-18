@@ -9,69 +9,110 @@ from pygraphviz import AGraph
 from sys import argv
 import operator
 
+
 # Utils
-def flatten(l):
-    return [item for sublist in l for item in sublist]
+def flatten(lst):
+    return [item for sublist in lst for item in sublist]
+
+
+# AST constructors
+def make_assign(node, expr):
+    node = deepcopy(node)
+    node.ctx = Store()
+    return Assign([node], expr)
+
+
+def make_aug_assign(node, op, value):
+    node = deepcopy(node)
+    node.ctx = Load()
+    expr = BinOp(node, op, value)
+    return make_assign(node, expr)
+
+
+def make_compare(node, cmp, expr):
+    node = deepcopy(node)
+    node.ctx = Load()
+    return Compare(node, [cmp], [expr])
+
+
+def make_subscript(var, indices):
+    assert indices
+    ctx = Load()
+    if len(indices) == 1:
+        return Subscript(Name(var, ctx), indices[0], ctx)
+    ss = make_subscript(var, indices[:-1])
+    return Subscript(ss, indices[-1], ctx)
+
+
+def make_call(fun, args):
+    return Call(Name(fun), args, [])
+
 
 # Plotting
 def setup_graph():
-    G = AGraph(strict = False, directed = True)
+    G = AGraph(strict=False, directed=True)
     graph_attrs = {
-        'dpi' : 300,
-        'ranksep' : 0.22,
-        'fontname' : 'Inconsolata',
-        'bgcolor' : 'transparent'
+        "dpi": 300,
+        "ranksep": 0.22,
+        "fontname": "Inconsolata",
+        "bgcolor": "transparent",
     }
     G.graph_attr.update(graph_attrs)
     node_attrs = {
-        'shape' : 'box',
-        'width' : 0.55,
-        'style' : 'filled',
-        'fillcolor' : 'white'
+        "shape": "box",
+        "width": 0.55,
+        "style": "filled",
+        "fillcolor": "white",
     }
     G.node_attr.update(node_attrs)
-    edge_attrs = {
-        'fontsize' : '10pt'
-    }
+    edge_attrs = {"fontsize": "10pt"}
     G.edge_attr.update(edge_attrs)
     return G
 
+
 NODE_FILLCOLORS = {
-    Subscript : '#ffddee',
-    BinOp : '#eeffdd',
-    Call : '#ddeeff',
-    List : '#eeddff',
-    Name : '#ffddee',
-    'input' : '#fff3cc'
+    Subscript: "#ffddee",
+    BinOp: "#eeffdd",
+    Call: "#ddeeff",
+    List: "#eeddff",
+    Name: "#ffddee",
+    "input": "#fff3cc",
 }
+
+
+def node_label(node):
+    tp = type(node)
+    if tp == Subscript:
+        return unparse(node)
+    elif tp == BinOp:
+        return OPS_STRINGS[type(node.op)]
+    elif tp == Call:
+        return node.func.id
+    elif tp == List:
+        return "[]"
+    elif tp == Name:
+        return node.id
+    assert False
+
+
+def node_fillcolor(node, input_vars):
+    def ss_name(node):
+        val = node.value
+        if type(val) == Name:
+            return val.id
+        return ss_name(val)
+
+    tp = type(node)
+    if tp == Subscript and ss_name(node) in input_vars:
+        return NODE_FILLCOLORS["input"]
+    return NODE_FILLCOLORS.get(tp, "white")
+
 
 def plot_defs(file_name, input_vars, defs):
     G = setup_graph()
 
     keyed_nodes = {}
     adj_list = defaultdict(list)
-
-    def node_label(node):
-        tp = type(node)
-        if tp == Subscript:
-            return unparse(node)
-        elif tp == BinOp:
-            return OPS_STRINGS[type(node.op)]
-        elif tp == Call:
-            return node.func.id
-        elif tp == List:
-            return '[]'
-        elif tp == Name:
-            return node.id
-        assert False
-
-    def node_fillcolor(node):
-        tp = type(node)
-        if tp == Subscript:
-            val = node.value
-            if type(val) == Name and val.id in input_vars:
-                return NODE_FILLCOLORS['input']
-        return NODE_FILLCOLORS.get(tp, 'white')
 
     def add_node(node):
         key = unparse(node)
@@ -95,32 +136,39 @@ def plot_defs(file_name, input_vars, defs):
             adj_list[key] = keys
             return key
 
-    # Fix this someday for multidimensional arrays.
-    for var, node in defs.items():
-        keys = add_node(node)
+    def add_indexed_nodes(var, path, keys):
         for i, key in enumerate(keys):
-            node = make_subscript(var, (Constant(i),))
-            key = unparse(node)
-            keyed_nodes[key] = node
-            adj_list[key] = [keys[i]]
+            new_path = path + [i]
+            if type(key) == list:
+                add_indexed_nodes(var, new_path, key)
+            else:
+                ss = [Constant(p) for p in new_path]
+                new_node = make_subscript(var, ss)
+                new_key = unparse(new_node)
+                keyed_nodes[new_key] = new_node
+                adj_list[new_key] = [key]
 
-    indexes = {n : i for (i, n) in enumerate(adj_list)}
+    # For scalars to scalars dataflows.
+    for var, node in defs.items():
+        add_indexed_nodes(var, [], add_node(node))
+
+    indexes = {n: i for (i, n) in enumerate(adj_list)}
     for k1, k2s in adj_list.items():
         i1 = indexes[k1]
         node = keyed_nodes[k1]
         kw = {
-            'label' : node_label(node),
-            'fillcolor' : node_fillcolor(node)
+            "label": node_label(node),
+            "fillcolor": node_fillcolor(node, input_vars),
         }
         G.add_node(i1, **kw)
         for k2 in k2s:
-            print(k2)
             i2 = indexes[k2]
             G.add_edge(i2, i1)
-    G.draw(file_name, prog = 'dot')
+    G.draw(file_name, prog="dot")
+
 
 # Templating
-VHDL_TMPL = '''
+VHDL_TMPL = """
 {% for key in meta['libraries'] -%}
 library {{ key }};
 {% endfor -%}
@@ -161,15 +209,26 @@ begin
         end if;
     end process;
 end architecture;
-'''.strip()
+""".strip()
 
 ENV = Environment()
 TMPL = ENV.from_string(VHDL_TMPL)
-
 LEAF_NODES = {
-    Add, Constant, Div, FloorDiv, Mod, Mult, Name, Pass, Sub,
-    Eq, Lt, LtE, USub
+    Add,
+    Constant,
+    Div,
+    FloorDiv,
+    Mod,
+    Mult,
+    Name,
+    Pass,
+    Sub,
+    Eq,
+    Lt,
+    LtE,
+    USub,
 }
+
 
 def container_childs(node):
     tp = type(node)
@@ -179,10 +238,12 @@ def container_childs(node):
         return node.elts
     assert False
 
+
 def rewrite_childs(childs, prefun, postfun):
     childs = [rewrite(n, prefun, postfun) for n in childs]
     childs = [c if isinstance(c, list) else [c] for c in childs if c]
     return flatten(childs)
+
 
 def rewrite(node, prefun, postfun):
     node = prefun(type(node), node)
@@ -252,8 +313,10 @@ def rewrite(node, prefun, postfun):
         childs = rewrite_childs(node.body, prefun, postfun)
         node = While(test, childs, [])
     elif tp == UnaryOp:
-        node = UnaryOp(rewrite(node.op, prefun, postfun),
-                       rewrite(node.operand, prefun, postfun))
+        node = UnaryOp(
+            rewrite(node.op, prefun, postfun),
+            rewrite(node.operand, prefun, postfun),
+        )
     elif tp in LEAF_NODES:
         pass
     else:
@@ -262,11 +325,14 @@ def rewrite(node, prefun, postfun):
     fix_missing_locations(node)
     return postfun(tp, node)
 
+
 def post_rewrite(node, postfun):
     return rewrite(node, lambda tp, n: n, postfun)
 
+
 def pre_rewrite(node, prefun):
     return rewrite(node, prefun, lambda tp, n: n)
+
 
 def intrinsic_zeros(args):
     if not args:
@@ -274,16 +340,17 @@ def intrinsic_zeros(args):
     childs = [intrinsic_zeros(args[1:]) for _ in range(args[0].value)]
     return List(childs, Load())
 
-INTRINSICS = {
-    'zeros' : intrinsic_zeros
-}
+
+INTRINSICS = {"zeros": intrinsic_zeros}
 
 # Functions that carry no logic cost and thus shouldn't have a cell in
 # the pipeline.
-NO_LOGICS = {'std_logic_vector', 'to_float'}
+NO_LOGICS = {"std_logic_vector", "to_float"}
+
 
 def setdef(defs, key, value):
     defs[-1][key] = value
+
 
 def setelem(node, path, src):
     tp = type(node)
@@ -297,6 +364,7 @@ def setelem(node, path, src):
         print(tp, unparse(node))
         assert False
 
+
 def setdef2(defs, dst, src):
     tp = type(dst)
     if tp == Name:
@@ -304,37 +372,13 @@ def setdef2(defs, dst, src):
     elif tp == Subscript:
         setelem(dst, [], src)
 
-def getdef(defs, key, default = None):
+
+def getdef(defs, key, default=None):
     for d in reversed(defs):
         if key in d:
             return d[key]
     return default
 
-def make_assign(node, expr):
-    node = deepcopy(node)
-    node.ctx = Store()
-    return Assign([node], expr)
-
-def make_aug_assign(node, op, value):
-    node = deepcopy(node)
-    node.ctx = Load()
-    expr = BinOp(node, op, value)
-    return make_assign(node, expr)
-
-def make_compare(node, cmp, expr):
-    node = deepcopy(node)
-    node.ctx = Load()
-    return Compare(node, [cmp], [expr])
-
-def make_subscript(var, indices):
-    ctx = Load()
-    if len(indices) == 1:
-        return Subscript(Name(var, ctx), indices[0], ctx)
-    ss = make_subscript(var, indices[:-1])
-    return Subscript(ss, indices[-1], ctx)
-
-def make_call(fun, args):
-    return Call(Name(fun), args, [])
 
 def desugar(tp, node):
     if tp == AugAssign:
@@ -356,25 +400,29 @@ def desugar(tp, node):
         return nodes
     return node
 
-OPS = {Add : operator.add,
-       Sub : operator.sub,
-       Div : operator.truediv,
-       Eq : operator.eq,
-       Lt : operator.lt,
-       LtE : operator.le,
-       Mult : operator.mul,
-       USub : operator.neg}
+
+OPS = {
+    Add: operator.add,
+    Sub: operator.sub,
+    Div: operator.truediv,
+    Eq: operator.eq,
+    Lt: operator.lt,
+    LtE: operator.le,
+    Mult: operator.mul,
+    USub: operator.neg,
+}
 
 OPS_STRINGS = {
-    Add : '+',
-    Div : '/',
-    Sub : '-',
-    Mult : '*',
-    Eq : '==',
-    Lt : '<',
-    LtE : '<='
+    Add: "+",
+    Div: "/",
+    Sub: "-",
+    Mult: "*",
+    Eq: "==",
+    Lt: "<",
+    LtE: "<=",
 }
 IDENT_0 = {Add, Sub}
+
 
 def const_eval(node):
     tp = type(node)
@@ -417,10 +465,13 @@ def const_eval(node):
         print(tp)
         assert False
 
+
 def bind_subst(defs):
     def subst(tp, node):
         return subst_vars(tp, node, defs)
+
     return subst
+
 
 def subst_vars(tp, node, defs):
     if tp == Assign:
@@ -437,11 +488,11 @@ def subst_vars(tp, node, defs):
         f = INTRINSICS.get(name)
         if f:
             return f(args)
-        f  = getdef(defs, name)
+        f = getdef(defs, name)
         if f:
             params, expr = getdef(defs, name)
             # Calling context
-            defs = [{p : a for (p, a) in zip(params, args)}]
+            defs = [{p: a for (p, a) in zip(params, args)}]
             return post_rewrite(expr, bind_subst(defs))
         node = tp(func, args, [])
     elif tp == Compare:
@@ -454,8 +505,10 @@ def subst_vars(tp, node, defs):
         return const_eval(node)
     return node
 
+
 def fmt_stage(stage):
-    return 's%d' % stage
+    return "s%d" % stage
+
 
 def ensure_name(node, stage, cnt, introduced):
     expr = unparse(node)
@@ -467,6 +520,7 @@ def ensure_name(node, stage, cnt, introduced):
         cnt[0] += 1
         return v
     return introduced[expr][0]
+
 
 # Merge these?
 def fully_pipelined(node):
@@ -480,6 +534,7 @@ def fully_pipelined(node):
     elif tp == Subscript:
         return type(node.value) == Name and type(node.slice) == Constant
     return False
+
 
 def node_is_const(node, inputs):
     tp = type(node)
@@ -496,23 +551,25 @@ def node_is_const(node, inputs):
         return lok and rok
     return False
 
+
 def pipeline_exprs(defs, inputs, gen):
     introduced = {}
     cnt = [0]
+
     def pipeline_exprs(tp, node):
         if tp in {BinOp, Call} and node_is_const(node, inputs):
             return ensure_name(node, gen, cnt, introduced)
         return node
+
     def pipeline_names(tp, node):
         if tp in {Name, Subscript} and unparse(node) in inputs:
             return ensure_name(node, gen, cnt, introduced)
         return node
 
-    defs = {k : post_rewrite(v, pipeline_exprs)
-            for (k, v) in defs.items()}
-    defs = {k : post_rewrite(v, pipeline_names)
-            for (k, v) in defs.items()}
+    defs = {k: post_rewrite(v, pipeline_exprs) for (k, v) in defs.items()}
+    defs = {k: post_rewrite(v, pipeline_names) for (k, v) in defs.items()}
     return introduced, defs
+
 
 def input_nodes(var, shape):
     cells = product(*[range(n) for n in shape])
@@ -520,66 +577,77 @@ def input_nodes(var, shape):
     cells = [make_subscript(var, cell) for cell in cells]
     return cells
 
+
 def node_to_vhdl(node):
     def comma_nodes(nodes):
-        return ', '.join(node_to_vhdl(n) for n in nodes)
+        return ", ".join(node_to_vhdl(n) for n in nodes)
+
     tp = type(node)
     if tp == Name:
         return node.id
     elif tp == Call:
-        return '%s(%s)' % (node.func.id, comma_nodes(node.args))
+        return "%s(%s)" % (node.func.id, comma_nodes(node.args))
     elif tp == Constant:
         return str(node.value)
     elif tp == Subscript:
-        return '%s(%s)' % (node_to_vhdl(node.value), node_to_vhdl(node.slice))
+        return "%s(%s)" % (node_to_vhdl(node.value), node_to_vhdl(node.slice))
     elif tp == BinOp:
         left = node_to_vhdl(node.left)
         right = node_to_vhdl(node.right)
         op = node_to_vhdl(node.op)
-        return '%s %s %s' % (left, op, right)
+        return "%s %s %s" % (left, op, right)
     elif tp == List:
-        return '\n(%s)' % comma_nodes(node.elts)
+        return "\n(%s)" % comma_nodes(node.elts)
     elif tp in OPS:
         return OPS_STRINGS[tp]
     else:
         print(tp)
         assert False
 
+
 def vars_to_vhdl(meta, vars, targets, entity):
 
-    types = meta['types']
+    types = meta["types"]
+
     def type_decl(shape):
         idx = len(shape)
-        tp  = types[idx]
+        tp = types[idx]
         if not idx:
             return tp
-        ranges = [f'(0 to {d - 1})' for d in shape]
+        ranges = [f"(0 to {d - 1})" for d in shape]
         return f'{tp}{"".join(ranges)}'
 
-    vars = [(stage_name, [(node_to_vhdl(l), node_to_vhdl(r))
-                          for (l, r) in stage_vars])
-            for (stage_name, stage_vars) in vars]
+    vars = [
+        (
+            stage_name,
+            [(node_to_vhdl(l), node_to_vhdl(r)) for (l, r) in stage_vars],
+        )
+        for (stage_name, stage_vars) in vars
+    ]
 
     targets = [(l, node_to_vhdl(r)) for (l, r) in targets.items()]
-    iface = [('in', n, sh) for (n, sh) in meta['inputs']]
-    iface += [('out', n, sh) for (n, sh) in  meta['outputs']]
+    iface = [("in", n, sh) for (n, sh) in meta["inputs"]]
+    iface += [("out", n, sh) for (n, sh) in meta["outputs"]]
     iface = [(d, n, type_decl(sh)) for (d, n, sh) in iface]
     return TMPL.render(
-        meta = meta,
-        entity = entity,
-        iface = iface,
-        types = types,
-        vars = vars,
-        targets = targets)
+        meta=meta,
+        entity=entity,
+        iface=iface,
+        types=types,
+        vars=vars,
+        targets=targets,
+    )
+
 
 def find_metadata_node(nodes):
     for i, node in enumerate(nodes):
         if type(node) == Assign:
             target = node.targets[0]
             tpt = type(target)
-            if tpt == Name and target.id == '__meta__':
+            if tpt == Name and target.id == "__meta__":
                 return i, node.value
     assert False
+
 
 def main():
     in_path = Path(argv[1])
@@ -588,9 +656,10 @@ def main():
     entity = in_path.stem
 
     defstack = [{}]
+
     def pre_subst(tp, node):
         if tp == FunctionDef:
-            print('  Traversing %s...' % node.name)
+            print("  Traversing %s..." % node.name)
             defstack.append({})
         elif tp == If:
             test = node.test
@@ -614,6 +683,7 @@ def main():
                     break
             return None
         return node
+
     def post_subst(tp, node):
         node = subst_vars(tp, node, defstack)
         if tp == FunctionDef:
@@ -623,45 +693,46 @@ def main():
             setdef(defstack, node.name, (params, ret.value))
             return None
         elif tp == If:
-            #defstack.pop()
+            # defstack.pop()
             return None
         return node
 
     mod = post_rewrite(mod, desugar)
 
     # Add initialization based on the metadata:
-    print('* Adding initialization')
+    print("* Adding initialization")
     inits = []
     i, meta = find_metadata_node(mod.body)
     for k, v in zip(meta.keys, meta.values):
-        if k.value == 'outputs':
+        if k.value == "outputs":
             for el in v.elts:
                 var, args = el.elts
-                call = make_call('zeros', args.elts)
+                call = make_call("zeros", args.elts)
                 inits.append(make_assign(Name(var.value), call))
-    mod.body = mod.body[:i + 1] + inits + mod.body[i + 1:]
+    mod.body = mod.body[: i + 1] + inits + mod.body[i + 1 :]
 
-    print('* Symbolic evaluation')
+    print("* Symbolic evaluation")
     mod = rewrite(mod, pre_subst, post_subst)
 
-    print('* Get metadata')
+    print("* Get metadata")
     meta = literal_eval(find_metadata_node(mod.body)[1])
 
-    targets = {t[0] for t in meta['outputs']}
+    targets = {t[0] for t in meta["outputs"]}
     defs = {}
     none = Constant(None)
     for t in sorted(targets):
         defs[t] = defstack[-1].get(t, none)
 
-    input_vars = [i[0] for i in meta['inputs']]
-    plot_defs(entity + '.png', input_vars, defs)
+    input_vars = [i[0] for i in meta["inputs"]]
+
+    plot_defs(entity + ".png", input_vars, defs)
 
     # Collect inputs
-    inputs = flatten(input_nodes(v, sh) for (v, sh) in meta['inputs'])
-    inputs = {unparse(i) : (i, i) for i in inputs}
+    inputs = flatten(input_nodes(v, sh) for (v, sh) in meta["inputs"])
+    inputs = {unparse(i): (i, i) for i in inputs}
 
     # Begin pipelining.
-    print('* Pipelining')
+    print("* Pipelining")
     stage = 1
     vars = []
     while not all(fully_pipelined(n) for n in defs.values()):
@@ -671,9 +742,9 @@ def main():
         stage += 1
 
     vhdl = vars_to_vhdl(meta, vars, defs, entity)
-    out_path = Path(entity + '.vhdl')
+    out_path = Path(entity + ".vhdl")
     print('* Writing VHDL to "%s".' % out_path)
-    with out_path.open('w') as f:
+    with out_path.open("w") as f:
         f.write(vhdl)
 
 
