@@ -17,27 +17,9 @@ import operator
 def flatten(lst):
     return [item for sublist in lst for item in sublist]
 
-console = Console(markup = False)
-
-def node_schedule_notation(node, input_vars):
-    tp = type(node)
-    expr = unparse(node)
-    if tp == BinOp:
-        fun = OPS_STRINGS[type(node.op)]
-        childs = [node_schedule_notation(n, input_vars)
-                  for n in node_childs(node)]
-        return (' %s ' % fun).join(childs)
-    elif tp == Call:
-        childs = [node_schedule_notation(n, input_vars)
-                  for n in node_childs(node)]
-        childs = ' '.join(childs)
-        return '%s %s' % (node.func.id, childs)
-    elif tp == Subscript:
-        if expr in input_vars:
-            return str(input_vars.index(expr))
-        return unparse(node.slice)
-    return expr
-
+def node_const_str(node):
+    v = node.value
+    return '%.3f' % v if type(v) == float else str(v)
 
 # AST constructors
 def make_assign(node, expr):
@@ -71,6 +53,81 @@ def make_subscript(var, indices):
 def make_call(fun, args):
     return Call(Name(fun), args, [])
 
+# Print schedule with Rich
+
+console = Console(markup = False)
+
+def node_schedule_label(node, inputs, constfun):
+    tp = type(node)
+    expr = unparse(node)
+    if tp == BinOp:
+        fun = OPS_STRINGS[type(node.op)]
+        childs = [node_schedule_label(n, inputs, constfun)
+                  for n in node_childs(node)]
+        return (' %s ' % fun).join(childs)
+    elif tp == Call:
+        childs = [node_schedule_label(n, inputs, constfun)
+                  for n in node_childs(node)]
+        childs = ' '.join(childs)
+        return '%s %s' % (node.func.id, childs)
+    elif tp == Constant:
+        return constfun(expr, node)
+    elif tp == Subscript:
+        if expr in inputs:
+            return str(inputs.index(expr))
+        return unparse(node.slice)
+    return expr
+
+def print_schedule(entity, vars, inputs, name_constants):
+    table = Table(title = 'Schedule for %s' % entity,
+                  box = ASCII2,
+                  padding = 0)
+
+    # Columns
+    n_cols = max(len(vs) for (st, vs) in vars)
+    cols = [('#', 'right')] + [(str(i), 'center') for i in range(n_cols)]
+    for name, just in cols:
+        table.add_column(name, justify = just)
+    constants = {}
+    for st, vs in vars:
+        row = [node_schedule_label(r, inputs, constants, name_constants)
+               for (_, r) in vs]
+        table.add_row(str(st), *row)
+
+    console.print(table)
+    if not name_constants:
+        return
+    cols = [('name', 'left'), ('value', 'right')]
+    table = Table(title = 'Named constants for %s' % entity,
+                  box = ASCII2,
+                  padding = 0)
+    for name, just in cols:
+        table.add_column(name, justify = just)
+    for (v0, v1) in constants.values():
+        table.add_row(v0, node_const_str(v1))
+    console.print(table)
+
+def row_data(nodes, inputs, constfun):
+    return [node_schedule_label(n, inputs, constfun) for n in nodes]
+
+def table_data(vars, inputs, constfun):
+    vars = [[n for (_, n) in vs] for vs in vars]
+    n_cols = max(len(nodes) for nodes in vars)
+    rows = [row_data(nodes, inputs, constfun) for nodes in vars]
+    rows = [row + ['-'] * (n_cols - len(row)) for row in rows]
+    rows = [[str(i)] + row for i, row in enumerate(rows)]
+    return rows
+
+def print_latex_schedule(entity, vars, inputs, constfun):
+    def fmt_row(row):
+        return ' & '.join('$%s$' % c for c in row) + '\\\\'
+    for row in table_data(vars, inputs, constfun):
+        print(fmt_row(row))
+
+def print_constants(constants):
+    for (v0, v1) in constants.values():
+        print(v0, node_const_str(v1))
+
 
 # Plotting
 def setup_graph():
@@ -98,15 +155,15 @@ NODE_FILLCOLORS = {
     Subscript: "#ffddee",
     BinOp: "#eeffdd",
     Call: "#ddeeff",
+    Constant: "#d9ffff",
     List: "#eeddff",
     Name: "#ffddee",
     "input": "#fff3cc",
 }
 
-
 def node_label(node):
     tp = type(node)
-    if tp == Subscript:
+    if tp in {Name, Subscript}:
         return unparse(node)
     elif tp == BinOp:
         return OPS_STRINGS[type(node.op)]
@@ -114,10 +171,10 @@ def node_label(node):
         return node.func.id
     elif tp == List:
         return "[]"
-    elif tp == Name:
-        return node.id
+    elif tp == Constant:
+        return node_const_str(node)
+    print(unparse(node))
     assert False
-
 
 def node_fillcolor(node, input_vars):
     def ss_name(node):
@@ -760,27 +817,24 @@ def main():
     vars = []
     while not all(fully_pipelined(n) for n in defs.values()):
         inputs, defs = pipeline_exprs(defs, inputs, stage)
-        vars.append((stage, list(inputs.values())))
+        vars.append(list(inputs.values()))
         inputs = {unparse(lv) for (lv, _) in inputs.values()}
         stage += 1
 
     # Write schedule
-    t = Table(title = 'Schedule for %s' % entity,
-              box = MARKDOWN,
-              padding = 0)
+    name_constants = True
+    consts = {}
+    def constfun(expr, node):
+        if not name_constants:
+            return node_const_str(node)
+        if not expr in consts:
+            lbl = 'c_{%d}' % len(consts)
+            consts[expr] = lbl, node
+        return consts[expr][0]
 
-    # Columns
-    n_cols = max(len(vs) for (st, vs) in vars)
-    cols = [('#', 'right')] + [(str(i), 'center') for i in range(n_cols)]
-    for name, just in cols:
-        t.add_column(name, justify = just)
-
-    for st, vs in vars:
-        row = [node_schedule_notation(r, input_vars) for (_, r) in vs]
-        t.add_row(str(st), *row)
-
-
-    console.print(t)
+    print_latex_schedule(entity, vars, input_vars, constfun)
+    print_constants(consts)
+    return
 
     out_path = Path(entity + ".vhdl")
     print('* Writing VHDL to "%s".' % out_path)
