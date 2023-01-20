@@ -6,6 +6,9 @@ from itertools import product
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, Template
 from pathlib import Path
 from pygraphviz import AGraph
+from rich.box import ASCII2, Box, MARKDOWN
+from rich.console import Console
+from rich.table import Table
 from sys import argv
 import operator
 
@@ -13,6 +16,27 @@ import operator
 # Utils
 def flatten(lst):
     return [item for sublist in lst for item in sublist]
+
+console = Console(markup = False)
+
+def node_schedule_notation(node, input_vars):
+    tp = type(node)
+    expr = unparse(node)
+    if tp == BinOp:
+        fun = OPS_STRINGS[type(node.op)]
+        childs = [node_schedule_notation(n, input_vars)
+                  for n in node_childs(node)]
+        return (' %s ' % fun).join(childs)
+    elif tp == Call:
+        childs = [node_schedule_notation(n, input_vars)
+                  for n in node_childs(node)]
+        childs = ' '.join(childs)
+        return '%s %s' % (node.func.id, childs)
+    elif tp == Subscript:
+        if expr in input_vars:
+            return str(input_vars.index(expr))
+        return unparse(node.slice)
+    return expr
 
 
 # AST constructors
@@ -103,7 +127,7 @@ def node_fillcolor(node, input_vars):
         return ss_name(val)
 
     tp = type(node)
-    if tp == Subscript and ss_name(node) in input_vars:
+    if tp == Subscript and unparse(node) in input_vars:
         return NODE_FILLCOLORS["input"]
     return NODE_FILLCOLORS.get(tp, "white")
 
@@ -165,6 +189,8 @@ def plot_defs(file_name, input_vars, defs):
             i2 = indexes[k2]
             G.add_edge(i2, i1)
     G.draw(file_name, prog="dot")
+
+
 
 
 # Templating
@@ -230,12 +256,20 @@ LEAF_NODES = {
 }
 
 
-def container_childs(node):
+# The node's "proper" childs.
+def node_childs(node):
     tp = type(node)
     if tp == Call:
         return node.args
+    elif tp == BinOp:
+        return [node.left, node.right]
     elif tp == List:
         return node.elts
+    elif tp == Subscript:
+        return [node.value, node.slice]
+    elif tp in LEAF_NODES:
+        return []
+    print(unparse(node))
     assert False
 
 
@@ -434,10 +468,11 @@ def const_eval(node):
         right = node.right
         ltp = type(left)
         rtp = type(right)
-        if ltp == Constant and left.value == 0 and top in IDENT_0:
-            return right
-        if rtp == Constant and right.value == 0 and top in IDENT_0:
-            return left
+        if top in IDENT_0:
+            if ltp == Constant and left.value == 0:
+                return right
+            if rtp == Constant and right.value == 0:
+                return left
         if ltp == rtp == Constant:
             return Constant(fun(left.value, right.value))
         return node
@@ -465,15 +500,10 @@ def const_eval(node):
         print(tp)
         assert False
 
-
-def bind_subst(defs):
-    def subst(tp, node):
+def subst_vars(tp, node, defs):
+    def subst_fun(tp, node):
         return subst_vars(tp, node, defs)
 
-    return subst
-
-
-def subst_vars(tp, node, defs):
     if tp == Assign:
         tgt = node.targets[0]
         setdef2(defs, tgt, node.value)
@@ -481,7 +511,7 @@ def subst_vars(tp, node, defs):
         return const_eval(node)
     elif tp == Call:
         # Evaluate args
-        args = [post_rewrite(a, bind_subst(defs)) for a in node.args]
+        args = [post_rewrite(a, subst_fun) for a in node.args]
         func = node.func
         name = func.id
 
@@ -493,7 +523,7 @@ def subst_vars(tp, node, defs):
             params, expr = getdef(defs, name)
             # Calling context
             defs = [{p: a for (p, a) in zip(params, args)}]
-            return post_rewrite(expr, bind_subst(defs))
+            return post_rewrite(expr, subst_fun)
         node = tp(func, args, [])
     elif tp == Compare:
         return const_eval(node)
@@ -508,7 +538,6 @@ def subst_vars(tp, node, defs):
 
 def fmt_stage(stage):
     return "s%d" % stage
-
 
 def ensure_name(node, stage, cnt, introduced):
     expr = unparse(node)
@@ -525,16 +554,10 @@ def ensure_name(node, stage, cnt, introduced):
 # Merge these?
 def fully_pipelined(node):
     tp = type(node)
-    if tp in {Constant, Name}:
-        return True
-    elif tp == List:
-        return all(fully_pipelined(n) for n in node.elts)
-    elif tp == Call:
-        return all(fully_pipelined(n) for n in node.args)
-    elif tp == Subscript:
-        return type(node.value) == Name and type(node.slice) == Constant
+    if tp in LEAF_NODES | {List, Call, Subscript}:
+        childs = node_childs(node)
+        return all(fully_pipelined(n) for n in childs)
     return False
-
 
 def node_is_const(node, inputs):
     tp = type(node)
@@ -619,10 +642,10 @@ def vars_to_vhdl(meta, vars, targets, entity):
 
     vars = [
         (
-            stage_name,
+            fmt_stage(stage),
             [(node_to_vhdl(l), node_to_vhdl(r)) for (l, r) in stage_vars],
         )
-        for (stage_name, stage_vars) in vars
+        for (stage, stage_vars) in vars
     ]
 
     targets = [(l, node_to_vhdl(r)) for (l, r) in targets.items()]
@@ -638,7 +661,6 @@ def vars_to_vhdl(meta, vars, targets, entity):
         targets=targets,
     )
 
-
 def find_metadata_node(nodes):
     for i, node in enumerate(nodes):
         if type(node) == Assign:
@@ -651,9 +673,9 @@ def find_metadata_node(nodes):
 
 def main():
     in_path = Path(argv[1])
+    entity = in_path.stem
     with in_path.open() as f:
         mod = parse(f.read())
-    entity = in_path.stem
 
     defstack = [{}]
 
@@ -693,7 +715,6 @@ def main():
             setdef(defstack, node.name, (params, ret.value))
             return None
         elif tp == If:
-            # defstack.pop()
             return None
         return node
 
@@ -723,13 +744,15 @@ def main():
     for t in sorted(targets):
         defs[t] = defstack[-1].get(t, none)
 
-    input_vars = [i[0] for i in meta["inputs"]]
-
-    plot_defs(entity + ".png", input_vars, defs)
+    inputs = meta['inputs']
 
     # Collect inputs
-    inputs = flatten(input_nodes(v, sh) for (v, sh) in meta["inputs"])
+    inputs = flatten(input_nodes(v, sh) for (v, sh) in inputs)
     inputs = {unparse(i): (i, i) for i in inputs}
+
+    # Plot dataflow
+    input_vars = list(inputs.keys())
+    plot_defs(entity + ".png", input_vars, defs)
 
     # Begin pipelining.
     print("* Pipelining")
@@ -737,14 +760,32 @@ def main():
     vars = []
     while not all(fully_pipelined(n) for n in defs.values()):
         inputs, defs = pipeline_exprs(defs, inputs, stage)
-        vars.append((fmt_stage(stage), list(inputs.values())))
+        vars.append((stage, list(inputs.values())))
         inputs = {unparse(lv) for (lv, _) in inputs.values()}
         stage += 1
 
-    vhdl = vars_to_vhdl(meta, vars, defs, entity)
+    # Write schedule
+    t = Table(title = 'Schedule for %s' % entity,
+              box = MARKDOWN,
+              padding = 0)
+
+    # Columns
+    n_cols = max(len(vs) for (st, vs) in vars)
+    cols = [('#', 'right')] + [(str(i), 'center') for i in range(n_cols)]
+    for name, just in cols:
+        t.add_column(name, justify = just)
+
+    for st, vs in vars:
+        row = [node_schedule_notation(r, input_vars) for (_, r) in vs]
+        t.add_row(str(st), *row)
+
+
+    console.print(t)
+
     out_path = Path(entity + ".vhdl")
     print('* Writing VHDL to "%s".' % out_path)
     with out_path.open("w") as f:
+        vhdl = vars_to_vhdl(meta, vars, defs, entity)
         f.write(vhdl)
 
 
