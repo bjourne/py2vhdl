@@ -1,5 +1,4 @@
 __meta__ = {
-    'neutral' : '0.0',
     'types' : ['real', 'real_vector', 'real_array2d_t'],
     'inputs' : [
         ('x', (8, 8))
