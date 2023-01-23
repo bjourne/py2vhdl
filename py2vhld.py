@@ -3,10 +3,11 @@ from ast import *
 from collections import defaultdict
 from copy import deepcopy
 from itertools import product
-from jinja2 import Environment, FileSystemLoader, StrictUndefined, Template
+from jinja2 import Environment, Template
 from pathlib import Path
 from pygraphviz import AGraph
-from rich.box import ASCII2, Box, MARKDOWN
+from re import sub
+from rich.box import ASCII2
 from rich.console import Console
 from rich.table import Table
 from sys import argv
@@ -78,35 +79,6 @@ def node_schedule_label(node, inputs, constfun):
         return unparse(node.slice)
     return expr
 
-def print_schedule(entity, vars, inputs, name_constants):
-    table = Table(title = 'Schedule for %s' % entity,
-                  box = ASCII2,
-                  padding = 0)
-
-    # Columns
-    n_cols = max(len(vs) for (st, vs) in vars)
-    cols = [('#', 'right')] + [(str(i), 'center') for i in range(n_cols)]
-    for name, just in cols:
-        table.add_column(name, justify = just)
-    constants = {}
-    for st, vs in vars:
-        row = [node_schedule_label(r, inputs, constants, name_constants)
-               for (_, r) in vs]
-        table.add_row(str(st), *row)
-
-    console.print(table)
-    if not name_constants:
-        return
-    cols = [('name', 'left'), ('value', 'right')]
-    table = Table(title = 'Named constants for %s' % entity,
-                  box = ASCII2,
-                  padding = 0)
-    for name, just in cols:
-        table.add_column(name, justify = just)
-    for (v0, v1) in constants.values():
-        table.add_row(v0, node_const_str(v1))
-    console.print(table)
-
 def row_data(nodes, inputs, constfun):
     return [node_schedule_label(n, inputs, constfun) for n in nodes]
 
@@ -115,19 +87,40 @@ def table_data(vars, inputs, constfun):
     n_cols = max(len(nodes) for nodes in vars)
     rows = [row_data(nodes, inputs, constfun) for nodes in vars]
     rows = [row + ['-'] * (n_cols - len(row)) for row in rows]
-    rows = [[str(i)] + row for i, row in enumerate(rows)]
-    return rows
+    return [[str(i)] + row for i, row in enumerate(rows)]
 
-def print_latex_schedule(entity, vars, inputs, constfun):
+def print_schedule_rich(entity, data):
+    table = Table(title = 'Schedule for %s' % entity, box = ASCII2)
+
+    # Columns
+    n_cols = max(len(row) for row in data)
+    cols = [('#', 'right')] + [(str(i), 'center') for i in range(n_cols)]
+    for name, just in cols:
+        table.add_column(name, justify = just)
+
+    for i, row in enumerate(data):
+        table.add_row(str(i), *row)
+
+    console.print(table)
+
+def print_latex_table(data):
+    def ss(name):
+        return sub(r'(\w+)_(\d+|\?)', r'\1_{\2}', str(name))
+
     def fmt_row(row):
-        return ' & '.join('$%s$' % c for c in row) + '\\\\'
-    for row in table_data(vars, inputs, constfun):
+        return ' & '.join('$%s$' % ss(c) for c in row) + '\\\\'
+    for row in data:
         print(fmt_row(row))
+    print()
 
-def print_constants(constants):
-    for (v0, v1) in constants.values():
-        print(v0, node_const_str(v1))
+def print_constants_rich(entity, data):
+    table = Table(title = 'Constants %s' % entity, box = ASCII2)
+    table.add_column('Name', 'left')
+    table.add_column('Value', 'right')
 
+    for row in data:
+        table.add_row(*row)
+    console.print(table)
 
 # Plotting
 def setup_graph():
@@ -280,7 +273,7 @@ begin
         if rising_edge(clk) then
             if rstn = '0' then
                 {% for sig_name, _ in vars -%}
-                {{ sig_name }} <= (others => {{ meta['neutral'] }});
+                {{ sig_name }} <= (others => {{ neutral }});
                 {% endfor %}
             else
                 {% for _, stage_vars in vars -%}
@@ -607,7 +600,6 @@ def ensure_name(node, stage, cnt, introduced):
         return v
     return introduced[expr][0]
 
-
 # Merge these?
 def fully_pipelined(node):
     tp = type(node)
@@ -689,6 +681,10 @@ def vars_to_vhdl(meta, vars, targets, entity):
 
     types = meta["types"]
 
+    # Neutral element
+    neutrals = {'integer' : '0', 'real' : '0.0'}
+    neutral = neutrals[types[0]]
+
     def type_decl(shape):
         idx = len(shape)
         tp = types[idx]
@@ -699,10 +695,10 @@ def vars_to_vhdl(meta, vars, targets, entity):
 
     vars = [
         (
-            fmt_stage(stage),
+            fmt_stage(i),
             [(node_to_vhdl(l), node_to_vhdl(r)) for (l, r) in stage_vars],
         )
-        for (stage, stage_vars) in vars
+        for (i, stage_vars) in enumerate(vars)
     ]
 
     targets = [(l, node_to_vhdl(r)) for (l, r) in targets.items()]
@@ -714,6 +710,7 @@ def vars_to_vhdl(meta, vars, targets, entity):
         entity=entity,
         iface=iface,
         types=types,
+        neutral=neutral,
         vars=vars,
         targets=targets,
     )
@@ -822,20 +819,31 @@ def main():
         stage += 1
 
     # Write schedule
-    name_constants = True
+    write_latex = False
+    name_constants = False
     consts = {}
+
     def constfun(expr, node):
         if not name_constants:
             return node_const_str(node)
         if not expr in consts:
-            lbl = 'c_{%d}' % len(consts)
+            lbl = 'c_%d' % len(consts)
             consts[expr] = lbl, node
         return consts[expr][0]
 
-    print_latex_schedule(entity, vars, input_vars, constfun)
-    print_constants(consts)
-    return
+    data = table_data(vars, input_vars, constfun)
+    if write_latex:
+        print_latex_table(data)
+    else:
+        print_schedule_rich(entity, data)
+    if name_constants:
+        consts = [[v0, node_const_str(v1)] for v0, v1 in consts.values()]
+        if write_latex:
+            print_latex_table(consts)
+        else:
+            print_constants_rich(entity, consts)
 
+    # Write VHDL
     out_path = Path(entity + ".vhdl")
     print('* Writing VHDL to "%s".' % out_path)
     with out_path.open("w") as f:

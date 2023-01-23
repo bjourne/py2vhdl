@@ -1,6 +1,5 @@
 __meta__ = {
     'types' : ['real', 'real_vector'],
-    'neutral' : '0.0',
     'inputs' : [('x', (8,))], 'outputs' : [('y', (8,))],
     'libraries' : ['ieee'],
     'uses' : [
