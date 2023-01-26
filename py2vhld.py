@@ -154,14 +154,20 @@ NODE_FILLCOLORS = {
     "input": "#fff3cc",
 }
 
-def node_label(node):
+def node_label(node, use_ss):
     tp = type(node)
     if tp in {Name, Subscript}:
-        return unparse(node)
+        s = unparse(node)
+        if use_ss:
+            return sub(r'(\w+)\[(\d+)\]', r'<<i>\1</i><sub>\2</sub>>', s)
+        return s
     elif tp == BinOp:
         return OPS_STRINGS[type(node.op)]
     elif tp == Call:
-        return node.func.id
+        s = node.func.id
+        if s == 'sqrt':
+            s = '√'
+        return s
     elif tp == List:
         return "[]"
     elif tp == Constant:
@@ -182,7 +188,7 @@ def node_fillcolor(node, input_vars):
     return NODE_FILLCOLORS.get(tp, "white")
 
 
-def plot_defs(file_name, input_vars, defs):
+def plot_defs(file_name, input_vars, defs, use_ss):
     G = setup_graph()
 
     keyed_nodes = {}
@@ -231,13 +237,14 @@ def plot_defs(file_name, input_vars, defs):
         i1 = indexes[k1]
         node = keyed_nodes[k1]
         kw = {
-            "label": node_label(node),
+            "label": node_label(node, use_ss),
             "fillcolor": node_fillcolor(node, input_vars),
         }
         G.add_node(i1, **kw)
         for k2 in k2s:
             i2 = indexes[k2]
             G.add_edge(i2, i1)
+    print(G)
     G.draw(file_name, prog="dot")
 
 
@@ -806,7 +813,7 @@ def main():
 
     # Plot dataflow
     input_vars = list(inputs.keys())
-    plot_defs(entity + ".png", input_vars, defs)
+    plot_defs(entity + ".png", input_vars, defs, True)
 
     # Begin pipelining.
     print("* Pipelining")
