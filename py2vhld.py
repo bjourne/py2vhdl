@@ -244,10 +244,7 @@ def plot_defs(file_name, input_vars, defs, use_ss):
         for k2 in k2s:
             i2 = indexes[k2]
             G.add_edge(i2, i1)
-    print(G)
     G.draw(file_name, prog="dot")
-
-
 
 
 # Templating
@@ -702,7 +699,7 @@ def vars_to_vhdl(meta, vars, targets, entity):
 
     vars = [
         (
-            fmt_stage(i),
+            fmt_stage(i + 1),
             [(node_to_vhdl(l), node_to_vhdl(r)) for (l, r) in stage_vars],
         )
         for (i, stage_vars) in enumerate(vars)
